@@ -1,458 +1,490 @@
 # Copyright (c) 2025, osama.ahmed@deliverydevs.com
 # For license information, please see license.txt
 
-import frappe
-from frappe.model.document import Document
-from frappe import _
-import requests
-from frappe.utils import today, now_datetime, get_datetime, flt
-from datetime import datetime, timedelta
 import json
+from datetime import timedelta
+
+import frappe
+import requests
+from frappe import _
+from frappe.model.document import Document
+from frappe.utils import cint, get_datetime, now_datetime, today
+
+ZKTECO_CONFIG = "ZKTeco Config"
+ALLOWED_ROLES = ("System Manager", "HR Manager", "HR User")
+
+REQUEST_TIMEOUT = 30
+MAX_PAGES = 20
+DEFAULT_SYNC_SECONDS = 300
+MIN_SYNC_SECONDS = 10
+THROTTLE_KEY = "zkteco_checkins_sync:next_run_at"
+DEVICE_ID_MAX_LENGTH = 140
 
 
 class ZKTecoConfig(Document):
-    pass
+	pass
 
 
-@frappe.whitelist()
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def get_config() -> Document:
+	"""Return the `ZKTeco Config` single doctype."""
+	return frappe.get_single(ZKTECO_CONFIG)
+
+
+def get_token(cfg: Document) -> str | None:
+	"""Return the decrypted API token.
+
+	`token` is a Password field, so the value stored on the document is only a masked
+	placeholder. Reading it via `frappe.db.get_single_value` would return the encrypted blob
+	and never authenticate, so always go through `get_password`.
+	"""
+	return (cfg.get_password("token", raise_exception=False) or "").strip() or None
+
+
+def build_url(cfg: Document, path: str) -> str:
+	"""Build an absolute URL for the ZKBio Time server.
+
+	Accepts a bare IP (`10.0.0.1`, `10.0.0.1:8080`) as well as a host that already carries a
+	scheme, and does not duplicate the port if it is already part of the host.
+	"""
+	host = (cfg.server_ip or "").strip().rstrip("/")
+	if not host:
+		frappe.throw(_("Please configure the server IP in {0}.").format(ZKTECO_CONFIG))
+
+	if "://" not in host:
+		host = f"http://{host}"
+
+	scheme, remainder = host.split("://", 1)
+
+	port = cint(cfg.server_port)
+	if port and ":" not in remainder.rsplit("/", 1)[-1]:
+		remainder = f"{remainder}:{port}"
+
+	return f"{scheme}://{remainder.rstrip('/')}/{path.lstrip('/')}"
+
+
+def get_headers(token: str) -> dict:
+	return {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+
+
+def parse_transaction_response(payload) -> tuple[list, int, str | None]:
+	"""Normalize the different response shapes returned by ZKBio Time / iClock.
+
+	Returns `(transactions, total_count, next_page_url)`.
+	"""
+	if isinstance(payload, dict):
+		if isinstance(payload.get("data"), list):
+			transactions = payload["data"]
+		elif isinstance(payload.get("results"), list):
+			transactions = payload["results"]
+		else:
+			transactions = []
+
+		return transactions, cint(payload.get("count")) or len(transactions), payload.get("next")
+
+	if isinstance(payload, list):
+		return payload, len(payload), None
+
+	return [], 0, None
+
+
+def map_log_type(punch_state, punch_state_display: str | None = None) -> str:
+	"""Map a device punch state onto an ERPNext `log_type`."""
+	if cint(punch_state) == 1:
+		return "OUT"
+
+	if (punch_state_display or "").strip().lower() == "check out":
+		return "OUT"
+
+	return "IN"
+
+
+def get_device_id(transaction: dict) -> str:
+	"""Return a stable, unique device id for a transaction.
+
+	The transaction id is embedded so the same punch is always mapped to the same
+	`Employee Checkin.device_id`, which is what makes de-duplication work.
+	"""
+	device = transaction.get("terminal_alias") or transaction.get("terminal_sn") or "ZKTeco Device"
+	transaction_id = transaction.get("id")
+
+	device_id = f"{device} (ZKTeco-{transaction_id})" if transaction_id else str(device)
+	return device_id[:DEVICE_ID_MAX_LENGTH]
+
+
+def find_employee_by_code(emp_code: str) -> str | None:
+	"""Find an Employee by any of the identifiers a device can report."""
+	if not emp_code:
+		return None
+
+	emp_code = str(emp_code).strip()
+
+	for fieldname in ("employee", "user_id", "attendance_device_id"):
+		# `attendance_device_id` only exists on ERPNext >= v14; check the meta instead of the
+		# database so this keeps working across versions.
+		if not frappe.get_meta("Employee").has_field(fieldname):
+			continue
+
+		name = frappe.db.get_value("Employee", {fieldname: emp_code}, "name")
+		if name:
+			return name
+
+	return None
+
+
+def get_sync_window(cfg: Document) -> tuple:
+	"""Return the `(start_time, end_time)` window to pull from the device."""
+	end_time = now_datetime()
+	last_sync = cfg.last_sync
+
+	if isinstance(last_sync, str):
+		last_sync = get_datetime(last_sync) if last_sync else None
+
+	# Fall back to the last hour when there is no previous run, or when the stored timestamp
+	# is in the future (clock skew / manual edit).
+	if not last_sync or last_sync > end_time:
+		last_sync = end_time - timedelta(hours=1)
+
+	return last_sync, end_time
+
+
+# ---------------------------------------------------------------------------
+# Device API
+# ---------------------------------------------------------------------------
+
+
+def request_transactions(cfg: Document, token: str, params: dict) -> tuple[list, int]:
+	"""Fetch transactions from the device, following pagination when the API provides it."""
+	url = build_url(cfg, "iclock/api/transactions/")
+	headers = get_headers(token)
+
+	transactions: list = []
+	total = 0
+	query = dict(params)
+
+	for page in range(1, MAX_PAGES + 1):
+		response = requests.get(url, headers=headers, params=query, timeout=REQUEST_TIMEOUT)
+		response.raise_for_status()
+
+		batch, count, next_url = parse_transaction_response(response.json())
+		transactions.extend(batch)
+		total = max(total, count)
+
+		if not next_url or not batch:
+			break
+
+		query = dict(params, page=page + 1)
+
+	return transactions, total
+
+
+# ---------------------------------------------------------------------------
+# Whitelisted methods
+# ---------------------------------------------------------------------------
+
+
+@frappe.whitelist(methods=["POST"])
 def register_api_token():
-    """
-    Calls the remote API to obtain a token and returns it to the client.
-    """
-    # Fetch from Single DocType
-    server_ip = frappe.db.get_single_value("ZKTeco Config", "server_ip")
-    server_port = frappe.db.get_single_value("ZKTeco Config", "server_port")
-    username = frappe.db.get_single_value("ZKTeco Config", "username")
-    password = frappe.db.get_single_value("ZKTeco Config", "password")
+	"""Exchange the ZKTeco superuser credentials for an API token and store it."""
+	frappe.only_for(ALLOWED_ROLES)
 
-    if not all([server_ip, server_port, username, password]):
-        frappe.throw(_("Please configure server IP, port, username, and password in ZKTeco Config."))
+	cfg = get_config()
+	password = cfg.get_password("password", raise_exception=False)
 
-    # Ensure scheme + port in URL
-    url = f"http://{server_ip}:{server_port}/api-token-auth/"
+	if not all([cfg.server_ip, cfg.server_port, cfg.username, password]):
+		frappe.throw(
+			_("Please configure server IP, port, username and password in {0}.").format(ZKTECO_CONFIG)
+		)
 
-    payload = {
-        "username": username,
-        "password": password
-    }
+	url = build_url(cfg, "api-token-auth/")
 
-    try:
-        resp = requests.post(url, json=payload, timeout=15)
-        resp.raise_for_status()
+	try:
+		response = requests.post(
+			url,
+			json={"username": cfg.username, "password": password},
+			timeout=REQUEST_TIMEOUT,
+		)
+		response.raise_for_status()
+		token = (response.json() or {}).get("token")
+	except ValueError:
+		frappe.throw(_("The device returned an invalid JSON response."))
+	except requests.RequestException as e:
+		frappe.throw(_("Connection error: {0}").format(str(e)), title=_("ZKTeco Device Unreachable"))
 
-        data = resp.json()
-        token = data.get("token")
-        if not token:
-            frappe.throw(_("Token not found in API response."))
+	if not token:
+		frappe.throw(_("Token not found in the device response."))
 
-        return {"success": True, "token": token}
+	cfg.token = token
+	cfg.save()
 
-    except requests.exceptions.RequestException as e:
-        frappe.throw(_("Connection error: {0}").format(str(e)))
+	# The token is deliberately not returned to the browser: it is a Password field and is
+	# only ever handed to the device over the wire.
+	return {"success": True, "message": _("API token registered successfully.")}
 
 
 @frappe.whitelist()
 def test_connection():
-    """
-    Enhanced test connection that shows latest transactions with detailed info
-    """
-    # Get token from the singleton config
-    cfg = frappe.get_single("ZKTeco Config")
-    token = (cfg.token or "").strip()
-    server_ip = frappe.db.get_single_value("ZKTeco Config", "server_ip")
-    server_port = frappe.db.get_single_value("ZKTeco Config", "server_port")
-    
-    if not token:
-        return {"ok": False, "error": _("Token not set in ZKTeco Config. Please register/save a token first.")}
+	"""Verify the stored token and preview today's transactions."""
+	frappe.only_for(ALLOWED_ROLES)
 
-    base_url = f"http://{server_ip}:{server_port}/iclock/api/transactions/"
-    day = today()
-    start_time = f"{day} 00:00:00"
-    end_time = f"{day} 23:59:59"
+	cfg = get_config()
+	token = get_token(cfg)
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-    params = {
-        "start_time": start_time,
-        "end_time": end_time,
-    }
+	if not token:
+		return {
+			"ok": False,
+			"error": _("No API token configured. Use 'Register API token' first."),
+		}
 
-    try:
-        resp = requests.get(base_url, headers=headers, params=params, timeout=15)
-        
-        if resp.ok:
-            try:
-                data = resp.json()
-                
-                # Process and format transaction data for display
-                formatted_transactions = []
-                transaction_count = 0
-                
-                # Handle ZKTeco API response structure
-                if isinstance(data, dict) and 'data' in data:
-                    transactions = data['data']
-                    transaction_count = data.get('count', len(transactions))
-                elif isinstance(data, dict) and 'results' in data:
-                    transactions = data['results']
-                    transaction_count = len(transactions)
-                elif isinstance(data, list):
-                    transactions = data
-                    transaction_count = len(transactions)
-                else:
-                    transactions = []
-                
-                # Format latest 5 transactions for preview
-                for transaction in transactions[:5]:
-                    try:
-                        # Map ZKTeco transaction fields based on actual API response
-                        emp_code = transaction.get('emp_code')
-                        punch_time = transaction.get('punch_time')
-                        punch_state = transaction.get('punch_state')
-                        punch_state_display = transaction.get('punch_state_display')
-                        device_id = transaction.get('terminal_alias') or transaction.get('terminal_sn')
-                        first_name = transaction.get('first_name', '')
-                        last_name = transaction.get('last_name', '') or ''
-                        verify_type_display = transaction.get('verify_type_display')
-                        
-                        # Combine first and last name
-                        zkteco_name = f"{first_name} {last_name}".strip()
-                        
-                        # Try to find employee name from ERPNext
-                        employee_name = zkteco_name
-                        erpnext_employee = None
-                        if emp_code:
-                            # Try to find employee by employee_id or user_id
-                            employee = frappe.db.get_value("Employee", 
-                                                         {"employee": emp_code}, 
-                                                         ["name", "employee_name"])
-                            if not employee:
-                                employee = frappe.db.get_value("Employee", 
-                                                             {"user_id": emp_code}, 
-                                                             ["name", "employee_name"])
-                            if employee:
-                                erpnext_employee = employee[0] if isinstance(employee, tuple) else employee
-                                employee_name = f"{employee[1]} (ERPNext)" if isinstance(employee, tuple) else f"{employee} (ERPNext)"
-                        
-                        # Determine log type based on punch_state
-                        log_type = "IN"
-                        if punch_state == "1" or punch_state_display == "Check Out":
-                            log_type = "OUT"
-                        
-                        formatted_transactions.append({
-                            "id": transaction.get('id'),
-                            "employee_code": emp_code,
-                            "employee_name": employee_name,
-                            "erpnext_employee": erpnext_employee,
-                            "punch_time": punch_time,
-                            "log_type": log_type,
-                            "punch_state_display": punch_state_display,
-                            "device_id": device_id,
-                            "verify_method": verify_type_display,
-                            "zkteco_name": zkteco_name,
-                            "department": transaction.get('department'),
-                            "raw_data": transaction
-                        })
-                    except Exception as e:
-                        frappe.log_error(f"Error processing transaction: {e}", "ZKTeco Transaction Processing")
-                        continue
-                
-                return {
-                    "ok": True,
-                    "status_code": resp.status_code,
-                    "url": resp.url,
-                    "total_transactions": transaction_count,
-                    "transactions_preview": formatted_transactions,
-                    "raw_sample": transactions[:2] if transactions else [],
-                    "message": f"Found {transaction_count} transactions for {day}"
-                }
-                
-            except json.JSONDecodeError as e:
-                return {
-                    "ok": False,
-                    "status_code": resp.status_code,
-                    "error": f"Invalid JSON response: {str(e)}",
-                    "raw_response": resp.text[:500]
-                }
-        else:
-            return {
-                "ok": False,
-                "status_code": resp.status_code,
-                "url": resp.url,
-                "error": f"HTTP {resp.status_code}: {resp.text[:200]}"
-            }
-            
-    except requests.RequestException as e:
-        return {
-            "ok": False,
-            "error": f"Connection error: {str(e)}"
-        }
+	if not (cfg.server_ip and cfg.server_port):
+		return {"ok": False, "error": _("Please configure the server IP and port first.")}
+
+	day = today()
+	params = {
+		"start_time": f"{day} 00:00:00",
+		"end_time": f"{day} 23:59:59",
+	}
+
+	try:
+		transactions, total = request_transactions(cfg, token, params)
+	except ValueError:
+		return {
+			"ok": False,
+			"error": _("The device returned an invalid JSON response."),
+		}
+	except requests.RequestException as e:
+		return {"ok": False, "error": _("Connection error: {0}").format(str(e))}
+
+	return {
+		"ok": True,
+		"url": build_url(cfg, "iclock/api/transactions/"),
+		"total_transactions": total,
+		"transactions_preview": build_transaction_preview(transactions[:5]),
+		"message": _("Found {0} transactions for {1}").format(total, day),
+	}
 
 
-def sync_zkteco_transactions():
-    """
-    Main function to sync ZKTeco transactions with ERPNext Employee Checkin records
-    """
-    # Check if sync is enabled
-    cfg = frappe.get_single("ZKTeco Config")
-    if not cfg.enable_sync:
-        frappe.log_error("ZKTeco sync is disabled", "ZKTeco Sync")
-        return
-    
-    if not cfg.token:
-        frappe.log_error("ZKTeco token not configured", "ZKTeco Sync")
-        return
-    
-    try:
-        # Get transactions from last sync or last hour
-        last_sync = frappe.db.get_single_value("ZKTeco Config", "last_sync") or (now_datetime() - timedelta(hours=1))
-        current_time = now_datetime()
-        
-        transactions = fetch_zkteco_transactions(cfg, last_sync, current_time)
-        
-        if transactions:
-            processed_count = 0
-            error_count = 0
-            
-            for transaction in transactions:
-                try:
-                    if create_employee_checkin(transaction):
-                        processed_count += 1
-                    else:
-                        error_count += 1
-                except Exception as e:
-                    error_count += 1
-                    frappe.log_error(f"Error creating checkin for transaction {transaction}: {str(e)}", "ZKTeco Sync Error")
-            
-            # Update last sync time and record count
-            total_synced = frappe.db.get_single_value("ZKTeco Config", "total_synced_records") or 0
-            frappe.db.set_single_value("ZKTeco Config", "last_sync", current_time)
-            frappe.db.set_single_value("ZKTeco Config", "total_synced_records", total_synced + processed_count)
-            frappe.db.commit()
-            
-            frappe.logger().info(f"ZKTeco Sync completed: {processed_count} processed, {error_count} errors")
-        
-    except Exception as e:
-        frappe.log_error(f"ZKTeco sync failed: {str(e)}", "ZKTeco Sync Fatal Error")
-
-
-def fetch_zkteco_transactions(cfg, start_time, end_time):
-    """
-    Fetch transactions from ZKTeco device
-    """
-    server_ip = cfg.server_ip
-    server_port = cfg.server_port
-    token = cfg.token
-    
-    base_url = f"http://{server_ip}:{server_port}/iclock/api/transactions/"
-    
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-    
-    params = {
-        "start_time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
-        "end_time": end_time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    
-    try:
-        resp = requests.get(base_url, headers=headers, params=params, timeout=30)
-        resp.raise_for_status()
-        
-        data = resp.json()
-        
-        # Handle ZKTeco API response format
-        if isinstance(data, dict) and 'data' in data:
-            return data['data']
-        elif isinstance(data, dict) and 'results' in data:
-            return data['results']
-        elif isinstance(data, list):
-            return data
-        else:
-            return []
-            
-    except Exception as e:
-        frappe.log_error(f"Failed to fetch ZKTeco transactions: {str(e)}", "ZKTeco API Error")
-        return []
-
-
-def create_employee_checkin(transaction):
-    """
-    Create Employee Checkin record from ZKTeco transaction
-    """
-    try:
-        # Extract transaction data based on ZKTeco API response structure
-        emp_code = transaction.get('emp_code')
-        punch_time = transaction.get('punch_time')
-        punch_state = transaction.get('punch_state')
-        device_id = transaction.get('terminal_alias') or transaction.get('terminal_sn')
-        transaction_id = transaction.get('id')
-        
-        if not emp_code or not punch_time:
-            frappe.log_error(f"Missing required fields in transaction: {transaction}", "ZKTeco Transaction Error")
-            return False
-        
-        # Find employee
-        employee = find_employee_by_code(emp_code)
-        if not employee:
-            frappe.log_error(f"Employee not found for code: {emp_code}", "ZKTeco Employee Mapping")
-            return False
-        
-        # Convert punch_time to datetime
-        if isinstance(punch_time, str):
-            punch_datetime = get_datetime(punch_time)
-        else:
-            punch_datetime = punch_time
-        
-        # Determine log type based on punch_state
-        log_type = "IN"
-        if punch_state == "1":  # Based on API response: "1" = Check Out
-            log_type = "OUT"
-        
-        # Check if checkin already exists (use transaction ID for uniqueness)
-        existing_checkin = frappe.db.exists("Employee Checkin", {
-            "employee": employee,
-            "time": punch_datetime,
-            "device_id": device_id
-        })
-        
-        if existing_checkin:
-            return True  # Already processed
-        
-        # Also check by transaction ID if we store it
-        if transaction_id:
-            existing_by_id = frappe.db.get_value("Employee Checkin", 
-                                               {"device_id": device_id, "employee": employee}, 
-                                               "name", 
-                                               {"time": ["between", [punch_datetime - timedelta(seconds=5), punch_datetime + timedelta(seconds=5)]]})
-            if existing_by_id:
-                return True
-        
-        # Create Employee Checkin
-        checkin = frappe.get_doc({
-            "doctype": "Employee Checkin",
-            "employee": employee,
-            "time": punch_datetime,
-            "log_type": log_type,
-            "device_id": f"{device_id} (ZKTeco-{transaction_id})" if transaction_id else device_id or "ZKTeco Device",
-            "skip_auto_attendance": 0
-        })
-        
-        checkin.insert(ignore_permissions=True)
-        frappe.db.commit()
-        
-        return True
-        
-    except Exception as e:
-        frappe.log_error(f"Error creating Employee Checkin: {str(e)}", "ZKTeco Checkin Creation")
-        return False
-
-
-def find_employee_by_code(emp_code):
-    """
-    Find employee by various ID fields
-    """
-    # Try employee field first
-    employee = frappe.db.get_value("Employee", {"employee": emp_code}, "name")
-    if employee:
-        return employee
-    
-    # Try user_id field
-    employee = frappe.db.get_value("Employee", {"user_id": emp_code}, "name")
-    if employee:
-        return employee
-    
-    # Try attendance_device_id if it exists
-    if frappe.db.has_column("Employee", "attendance_device_id"):
-        employee = frappe.db.get_value("Employee", {"attendance_device_id": emp_code}, "name")
-        if employee:
-            return employee
-    
-    return None
-
-
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def manual_sync():
-    """
-    Manual sync trigger for testing
-    """
-    try:
-        sync_zkteco_transactions()
-        return {"success": True, "message": "Sync completed successfully"}
-    except Exception as e:
-        frappe.log_error(f"Manual sync failed: {str(e)}", "ZKTeco Manual Sync")
-        return {"success": False, "message": f"Sync failed: {str(e)}"}
+	"""Run a sync on demand and report what happened."""
+	frappe.only_for(ALLOWED_ROLES)
 
+	try:
+		result = sync_zkteco_transactions(commit=True)
+	except Exception as e:
+		frappe.log_error(
+			title=_("ZKTeco Manual Sync"),
+			message=frappe.get_traceback(),
+		)
+		frappe.throw(_("Sync failed: {0}").format(str(e)), title=_("ZKTeco Sync Failed"))
 
-def scheduled_sync():
-    """
-    Scheduled sync function that respects the frequency setting
-    """
-    try:
-        cfg = frappe.get_single("ZKTeco Config")
-        if not cfg.enable_sync:
-            return
-            
-        # For frequent syncs (less than 60 seconds), check if we should actually run
-        sync_seconds = int(cfg.seconds or 300)
-        if sync_seconds < 60:
-            last_run = frappe.cache().get_value("zkteco_last_sync_run")
-            current_time = now_datetime()
-            
-            if last_run:
-                time_diff = (current_time - get_datetime(last_run)).total_seconds()
-                if time_diff < sync_seconds:
-                    return  # Not yet time for next sync
-            
-            # Update last run time
-            frappe.cache().set_value("zkteco_last_sync_run", current_time)
-        
-        sync_zkteco_transactions()
-        
-    except Exception as e:
-        frappe.log_error(f"Scheduled ZKTeco sync failed: {str(e)}", "ZKTeco Scheduled Sync Error")
-
-
-def cleanup_scheduler_check():
-    """
-    Cleanup function to ensure scheduler is working properly
-    """
-    try:
-        cfg = frappe.get_single("ZKTeco Config")
-        if cfg.enable_sync:
-            # Log that the scheduler is active
-            frappe.logger().info("ZKTeco scheduler check: Active")
-    except Exception as e:
-        frappe.log_error(f"ZKTeco scheduler check failed: {str(e)}", "ZKTeco Scheduler Check")
+	return {"success": True, "message": _("Sync completed."), **result}
 
 
 @frappe.whitelist()
 def get_sync_status():
-    """
-    Get current sync status and statistics
-    """
-    try:
-        cfg = frappe.get_single("ZKTeco Config")
-        
-        # Get last sync time
-        last_sync = frappe.db.get_single_value("ZKTeco Config", "last_sync")
-        
-        # Count recent employee checkins from ZKTeco
-        recent_checkins = frappe.db.count("Employee Checkin", {
-            "device_id": ["like", "%ZKTeco%"],
-            "creation": [">=", frappe.utils.add_days(today(), -1)]
-        })
-        
-        return {
-            "enabled": cfg.enable_sync,
-            "sync_frequency": cfg.seconds,
-            "last_sync": last_sync,
-            "recent_checkins_24h": recent_checkins,
-            "server_configured": bool(cfg.server_ip and cfg.server_port),
-            "token_configured": bool(cfg.token)
-        }
-        
-    except Exception as e:
-        return {"error": str(e)}
+	"""Return the current configuration and sync statistics."""
+	frappe.only_for(ALLOWED_ROLES)
+
+	try:
+		cfg = get_config()
+		recent_checkins = frappe.db.count(
+			"Employee Checkin",
+			{"device_id": ["like", "%ZKTeco%"], "creation": [">=", now_datetime() - timedelta(days=1)]},
+		)
+
+		return {
+			"enabled": bool(cfg.enable_sync),
+			"sync_frequency": cint(cfg.seconds) or DEFAULT_SYNC_SECONDS,
+			"last_sync": cfg.last_sync,
+			"recent_checkins_24h": recent_checkins,
+			"server_configured": bool(cfg.server_ip and cfg.server_port),
+			"token_configured": bool(get_token(cfg)),
+		}
+	except Exception:
+		frappe.log_error(title=_("ZKTeco Sync Status"), message=frappe.get_traceback())
+		return {"error": _("Could not read the current sync status.")}
+
+
+# ---------------------------------------------------------------------------
+# Sync
+# ---------------------------------------------------------------------------
+
+
+def build_transaction_preview(transactions: list) -> list:
+	"""Format transactions for the 'Test Connection' dialog."""
+	preview = []
+
+	for transaction in transactions:
+		emp_code = transaction.get("emp_code")
+		employee_name = " ".join(
+			filter(None, [transaction.get("first_name") or "", transaction.get("last_name") or ""])
+		)
+		employee = find_employee_by_code(emp_code) if emp_code else None
+
+		preview.append(
+			{
+				"id": transaction.get("id"),
+				"employee_code": emp_code,
+				"employee_name": employee_name,
+				"mapped_employee": employee,
+				"punch_time": transaction.get("punch_time"),
+				"log_type": map_log_type(
+					transaction.get("punch_state"), transaction.get("punch_state_display")
+				),
+				"device_id": transaction.get("terminal_alias") or transaction.get("terminal_sn"),
+				"verify_method": transaction.get("verify_type_display"),
+			}
+		)
+
+	return preview
+
+
+def sync_zkteco_transactions(commit: bool = False) -> dict:
+	"""Pull new device punches and create the matching `Employee Checkin` records."""
+	cfg = get_config()
+
+	if not cfg.enable_sync:
+		frappe.logger("zkteco_checkins_sync").info("ZKTeco sync is disabled. Skipping run.")
+		return {"processed": 0, "errors": 0, "skipped": True}
+
+	token = get_token(cfg)
+	if not token:
+		frappe.logger("zkteco_checkins_sync").info("ZKTeco API token is not configured. Skipping run.")
+		return {"processed": 0, "errors": 0, "skipped": True}
+
+	start_time, end_time = get_sync_window(cfg)
+	params = {
+		"start_time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+		"end_time": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+	}
+	transactions, _ = request_transactions(cfg, token, params)
+
+	processed = 0
+	errors = 0
+
+	for transaction in transactions:
+		try:
+			if create_employee_checkin(transaction):
+				processed += 1
+			else:
+				errors += 1
+		except Exception:
+			errors += 1
+			frappe.log_error(
+				title=_("ZKTeco Sync"),
+				message=frappe.get_traceback(),
+				reference_doctype="Employee Checkin",
+			)
+
+	frappe.db.set_single_value(ZKTECO_CONFIG, "last_sync", end_time)
+	frappe.db.set_single_value(
+		ZKTECO_CONFIG, "total_synced_records", cint(cfg.total_synced_records) + processed
+	)
+
+	if commit:
+		frappe.db.commit()
+
+	frappe.logger("zkteco_checkins_sync").info(
+		_("ZKTeco sync completed: {0} processed, {1} errors.").format(processed, errors)
+	)
+
+	return {"processed": processed, "errors": errors, "skipped": False}
+
+
+def create_employee_checkin(transaction: dict) -> bool:
+	"""Create an `Employee Checkin` for a single device transaction.
+
+	Returns True when the punch was created or had already been imported, False otherwise.
+	"""
+	emp_code = transaction.get("emp_code")
+	punch_time = transaction.get("punch_time")
+
+	if not emp_code or not punch_time:
+		frappe.log_error(
+			title=_("ZKTeco Transaction"),
+			message=_("Skipping a transaction without emp_code or punch_time: {0}").format(
+				json.dumps(transaction, default=str)
+			),
+		)
+		return False
+
+	employee = find_employee_by_code(emp_code)
+	if not employee:
+		frappe.logger("zkteco_checkins_sync").info(
+			_("No ERPNext employee matches device code {0}.").format(emp_code)
+		)
+		return False
+
+	punch_datetime = get_datetime(punch_time) if isinstance(punch_time, str) else punch_time
+	device_id = get_device_id(transaction)
+	log_type = map_log_type(transaction.get("punch_state"), transaction.get("punch_state_display"))
+
+	# `device_id` embeds the transaction id, so an identical punch always produces an
+	# identical device_id and the existence check is an exact de-duplication.
+	if frappe.db.exists("Employee Checkin", {"employee": employee, "device_id": device_id}):
+		return True
+
+	try:
+		frappe.get_doc(
+			{
+				"doctype": "Employee Checkin",
+				"employee": employee,
+				"time": punch_datetime,
+				"log_type": log_type,
+				"device_id": device_id,
+				"skip_auto_attendance": 0,
+			}
+		).insert(ignore_permissions=True)
+	except Exception:
+		frappe.log_error(
+			title=_("ZKTeco Checkin Creation"),
+			message=frappe.get_traceback(),
+			reference_doctype="Employee Checkin",
+		)
+		return False
+
+	return True
+
+
+# ---------------------------------------------------------------------------
+# Scheduled tasks
+# ---------------------------------------------------------------------------
+
+
+def scheduled_sync():
+	"""Cron entry point: sync, but no more often than the configured frequency."""
+	cfg = get_config()
+
+	if not cfg.enable_sync:
+		return
+
+	interval = max(cint(cfg.seconds) or DEFAULT_SYNC_SECONDS, MIN_SYNC_SECONDS)
+
+	# Throttle on Redis rather than on the document, so a failed run cannot get stuck and
+	# the timer survives `bench migrate`. `expires=True` skips the per-request local cache.
+	if frappe.cache().get_value(THROTTLE_KEY, expires=True):
+		return
+
+	frappe.cache().set_value(THROTTLE_KEY, now_datetime(), expires_in_sec=interval)
+
+	try:
+		sync_zkteco_transactions(commit=True)
+	except Exception:
+		frappe.log_error(title=_("ZKTeco Scheduled Sync"), message=frappe.get_traceback())
+
+
+def cleanup_scheduler_check():
+	"""Daily heartbeat, so there is a trace in the logs that the job is alive."""
+	try:
+		cfg = get_config()
+		if cfg.enable_sync:
+			frappe.logger("zkteco_checkins_sync").info(
+				_("ZKTeco scheduler is active. Last sync: {0}").format(cfg.last_sync or _("never"))
+			)
+	except Exception:
+		frappe.log_error(title=_("ZKTeco Scheduler Check"), message=frappe.get_traceback())

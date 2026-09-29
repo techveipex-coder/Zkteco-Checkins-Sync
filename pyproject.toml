@@ -3,12 +3,12 @@ name = "zkteco_checkins_sync"
 authors = [
     { name = "osama.ahmed@deliverydevs.com", email = "osama.ahmed@deliverydevs.com"}
 ]
-description = "This app pulls transactions from device and creates Employee Checkin records."
+description = "This app pulls transactions from ZKTeco devices and creates Employee Checkin records."
 requires-python = ">=3.10"
 readme = "README.md"
 dynamic = ["version"]
 dependencies = [
-    # "frappe~=15.0.0" # Installed and managed by bench.
+    "requests>=2.31",
 ]
 
 [build-system]
@@ -17,4 +17,33 @@ build-backend = "flit_core.buildapi"
 
 # These dependencies are only installed when developer mode is enabled
 [tool.bench.dev-dependencies]
-# package_name = "~=1.1.0"
+
+# Frappe Cloud / bench uses this to validate framework versions on `bench setup requirements`.
+[tool.bench.frappe-dependencies]
+frappe = ">=16.0.0,<17.0.0"
+erpnext = ">=16.0.0,<17.0.0"
+hrms = ">=16.0.0,<17.0.0"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "UP", "B", "RUF"]
+ignore = [
+    "B017",
+    "B018",
+    "B904",
+    "E101",
+    "E402",
+    "E501",
+    "E741",
+    "W191",
+    "W605",
+    "UP030",
+    "UP031",
+    "UP032",
+    "UP037",
+    "RUF012",
+]
+typing-modules = ["frappe.types.DF"]

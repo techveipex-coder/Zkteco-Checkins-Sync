@@ -1,25 +1,16 @@
 app_name = "zkteco_checkins_sync"
 app_title = "ZKTeco Checkin Sync"
 app_publisher = "osama.ahmed@deliverydevs.com"
-app_description = "This app pulls transactions from device and creates Employee Checkin records."
+app_description = "This app pulls transactions from ZKTeco devices and creates Employee Checkin records."
 app_email = "osama.ahmed@deliverydevs.com"
 app_license = "mit"
 
 # Apps
 # ------------------
 
-# required_apps = []
-
-# Each item in the list will be shown as an app in the apps page
-# add_to_apps_screen = [
-# 	{
-# 		"name": "zkteco_checkins_sync",
-# 		"logo": "/assets/zkteco_checkins_sync/logo.png",
-# 		"title": "ZKTeco Checkin Sync",
-# 		"route": "/zkteco_checkins_sync",
-# 		"has_permission": "zkteco_checkins_sync.api.permission.has_app_permission"
-# 	}
-# ]
+# `Employee` ships with ERPNext and `Employee Checkin` ships with HRMS (as of v16 it is no
+# longer part of ERPNext's `hr` module). Both must be installed before this app.
+required_apps = ["erpnext", "hrms"]
 
 # Includes in <head>
 # ------------------
@@ -35,19 +26,6 @@ app_license = "mit"
 # include custom scss in every website theme (without file extension ".scss")
 # website_theme_scss = "zkteco_checkins_sync/public/scss/website"
 
-# include js, css files in header of web form
-# webform_include_js = {"doctype": "public/js/doctype.js"}
-# webform_include_css = {"doctype": "public/css/doctype.css"}
-
-# include js in page
-# page_js = {"page" : "public/js/file.js"}
-
-# include js in doctype views
-# doctype_js = {"doctype" : "public/js/doctype.js"}
-# doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
-# doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
-# doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}
-
 # Svg Icons
 # ------------------
 # include app icons in desk
@@ -56,29 +34,6 @@ app_license = "mit"
 # Home Pages
 # ----------
 
-# application home page (will override Website Settings)
-# home_page = "login"
-
-# website user home page (by Role)
-# role_home_page = {
-# 	"Role": "home_page"
-# }
-
-# Generators
-# ----------
-
-# automatically create page for each record of this doctype
-# website_generators = ["Web Page"]
-
-# Jinja
-# ----------
-
-# add methods and filters to jinja environment
-# jinja = {
-# 	"methods": "zkteco_checkins_sync.utils.jinja_methods",
-# 	"filters": "zkteco_checkins_sync.utils.jinja_filters"
-# }
-
 # Installation
 # ------------
 
@@ -86,7 +41,7 @@ app_license = "mit"
 # after_install = "zkteco_checkins_sync.install.after_install"
 
 # Uninstallation
-# ------------
+# --------------
 
 # before_uninstall = "zkteco_checkins_sync.uninstall.before_uninstall"
 # after_uninstall = "zkteco_checkins_sync.uninstall.after_uninstall"
@@ -115,15 +70,6 @@ app_license = "mit"
 
 # Permissions
 # -----------
-# Permissions evaluated in scripted ways
-
-# permission_query_conditions = {
-# 	"Event": "frappe.desk.doctype.event.event.get_permission_query_conditions",
-# }
-#
-# has_permission = {
-# 	"Event": "frappe.desk.doctype.event.event.has_permission",
-# }
 
 # DocType Class
 # ---------------
@@ -145,93 +91,24 @@ app_license = "mit"
 # 	}
 # }
 
-# Scheduled Tasks - Dynamic ZKTeco Sync
+# Scheduled Tasks
 # ---------------
+# IMPORTANT: `scheduler_events` must stay a static literal. Frappe imports this module at
+# `frappe.init()` time (before the site database is connected) and caches the result, so
+# querying `ZKTeco Config` here is unreliable and breaks `bench build`, `bench new-site` and
+# `bench migrate`. The sync interval configured by the user is therefore applied at runtime
+# inside `scheduled_sync`, which throttles itself using the configured frequency.
 
-def get_scheduler_events():
-    """
-    Dynamic scheduler that adjusts based on ZKTeco Config settings
-    """
-    import frappe
-    
-    # Get sync settings
-    try:
-        cfg = frappe.get_single("ZKTeco Config")
-        if not cfg.enable_sync:
-            return {}
-        
-        sync_seconds = int(cfg.seconds or 300)  # Default 5 minutes
-        
-        # Map seconds to cron expressions
-        sync_schedule = {}
-        
-        if sync_seconds <= 60:
-            # For frequent syncs (every minute or less), use cron for every minute
-            sync_schedule = {
-                "cron": {
-                    "* * * * *": [
-                        "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.scheduled_sync"
-                    ]
-                }
-            }
-        elif sync_seconds <= 300:  # 5 minutes
-            sync_schedule = {
-                "cron": {
-                    "*/5 * * * *": [
-                        "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.sync_zkteco_transactions"
-                    ]
-                }
-            }
-        elif sync_seconds <= 600:  # 10 minutes
-            sync_schedule = {
-                "cron": {
-                    "*/10 * * * *": [
-                        "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.sync_zkteco_transactions"
-                    ]
-                }
-            }
-        elif sync_seconds <= 900:  # 15 minutes
-            sync_schedule = {
-                "cron": {
-                    "*/15 * * * *": [
-                        "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.sync_zkteco_transactions"
-                    ]
-                }
-            }
-        elif sync_seconds <= 1800:  # 30 minutes
-            sync_schedule = {
-                "cron": {
-                    "*/30 * * * *": [
-                        "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.sync_zkteco_transactions"
-                    ]
-                }
-            }
-        else:  # 1 hour or more
-            sync_schedule = {
-                "hourly": [
-                    "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.sync_zkteco_transactions"
-                ]
-            }
-        
-        return sync_schedule
-        
-    except Exception as e:
-        frappe.log_error(f"Error in ZKTeco dynamic scheduler: {str(e)}", "ZKTeco Scheduler Error")
-        return {}
-
-# Apply dynamic scheduler
-scheduler_events = get_scheduler_events()
-
-# Fallback static scheduler for basic functionality
-if not scheduler_events:
-    scheduler_events = {
-        "all": [
-            "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.cleanup_scheduler_check"
-        ],
-        "hourly": [
-            "zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.sync_zkteco_transactions"
-        ]
-    }
+scheduler_events = {
+	"cron": {
+		"* * * * *": [
+			"zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.scheduled_sync"
+		]
+	},
+	"daily": [
+		"zkteco_checkins_sync.zkteco_checkin_sync.doctype.zkteco_config.zkteco_config.cleanup_scheduler_check"
+	],
+}
 
 # Testing
 # -------
@@ -240,26 +117,9 @@ if not scheduler_events:
 
 # Overriding Methods
 # ------------------------------
-#
-# override_whitelisted_methods = {
-# 	"frappe.desk.doctype.event.event.get_events": "zkteco_checkins_sync.event.get_events"
-# }
-#
-# each overriding function accepts a `data` argument;
-# generated from the base implementation of the doctype dashboard,
-# along with any modifications made in other Frappe apps
-# override_doctype_dashboards = {
-# 	"Task": "zkteco_checkins_sync.task.get_dashboard_data"
-# }
 
 # exempt linked doctypes from being automatically cancelled
-#
 # auto_cancel_exempted_doctypes = ["Auto Repeat"]
-
-# Ignore links to specified DocTypes when deleting documents
-# -----------------------------------------------------------
-
-# ignore_links_on_delete = ["Communication", "ToDo"]
 
 # Request Events
 # ----------------
@@ -274,27 +134,6 @@ if not scheduler_events:
 # User Data Protection
 # --------------------
 
-# user_data_fields = [
-# 	{
-# 		"doctype": "{doctype_1}",
-# 		"filter_by": "{filter_by}",
-# 		"redact_fields": ["{field_1}", "{field_2}"],
-# 		"partial": 1,
-# 	},
-# 	{
-# 		"doctype": "{doctype_2}",
-# 		"filter_by": "{filter_by}",
-# 		"partial": 1,
-# 	},
-# 	{
-# 		"doctype": "{doctype_3}",
-# 		"strict": False,
-# 	},
-# 	{
-# 		"doctype": "{doctype_4}"
-# 	}
-# ]
-
 # Authentication and authorization
 # --------------------------------
 
@@ -304,7 +143,3 @@ if not scheduler_events:
 
 # Automatically update python controller files with type annotations for this app.
 # export_python_type_annotations = True
-
-# default_log_clearing_doctypes = {
-# 	"Logging DocType Name": 30  # days to retain logs
-# }

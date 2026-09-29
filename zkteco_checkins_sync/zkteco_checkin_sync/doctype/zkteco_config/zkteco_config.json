@@ -56,8 +56,9 @@
    "label": "ZKTeco API Credentials"
   },
   {
+   "description": "Issued by the device. Stored encrypted and never sent to the browser in clear text. Use 'Register API token' to refresh it.",
    "fieldname": "token",
-   "fieldtype": "Data",
+   "fieldtype": "Password",
    "label": "Token",
    "read_only": 1
   },
@@ -106,7 +107,7 @@
    "fieldtype": "Column Break"
   },
   {
-   "depends_on": "eval:doc.server_ip && doc.server_port && doc.token",
+   "depends_on": "eval:doc.server_ip && doc.server_port",
    "fieldname": "test_connection",
    "fieldtype": "Button",
    "label": "Test Connection"

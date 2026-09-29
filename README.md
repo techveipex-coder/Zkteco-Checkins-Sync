@@ -1,15 +1,30 @@
 # ZKTeco Checkin Sync - Installation & Setup Guide
 
 ## Overview
-This Frappe/ERPNext app automatically synchronizes employee check-in/check-out transactions from ZKTeco biometric devices with ERPNext Employee Checkin records.
+This Frappe app automatically synchronizes employee check-in/check-out transactions from ZKTeco biometric devices with ERPNext/HRMS Employee Checkin records.
+
+## Version compatibility
+
+| App version | Frappe | Notes |
+|-------------|--------|-------|
+| `1.0.0` (current) | **v16** | Requires ERPNext v16 **and** HRMS v16 |
+| `0.0.1` (legacy) | v15 | Not supported on v16; upgrade first |
+
+> **Important for v16:** `Employee Checkin` is no longer part of ERPNext. It now ships with
+> **HRMS** (module `HR`). ERPNext v16 has no `hr` module at all. `Employee` itself now lives in
+> ERPNext's `Setup` module. This app therefore declares `required_apps = ["erpnext", "hrms"]`
+> and will refuse to install without both.
 
 ## Features
-- ✅ **Real-time Sync**: Configurable sync frequency (10 seconds to 1 hour)
-- ✅ **Smart Mapping**: Automatically maps ZKTeco employee codes to ERPNext employees
-- ✅ **Duplicate Prevention**: Prevents duplicate check-in records
-- ✅ **Test Connection**: Preview transactions before enabling sync
-- ✅ **Dynamic Scheduler**: Adjusts cron jobs based on sync frequency
-- ✅ **Comprehensive Logging**: Detailed error tracking and sync statistics
+- **Real-time Sync**: Configurable sync frequency (10 seconds to 1 hour)
+- **Smart Mapping**: Automatically maps ZKTeco employee codes to ERPNext employees
+- **Duplicate Prevention**: Prevents duplicate check-in records
+- **Test Connection**: Preview transactions before enabling sync
+- **Adaptive Scheduler**: A single every-minute cron job throttles itself to your configured frequency
+- **Paginated Import**: Follows the device's pagination so large days import completely
+- **Role-protected**: Every API is restricted to System Manager / HR Manager / HR User
+- **Secure Credentials**: Superuser password and API token are stored encrypted
+- **Comprehensive Logging**: Detailed error tracking and sync statistics
 
 ## Prerequisites
 
@@ -19,27 +34,39 @@ This Frappe/ERPNext app automatically synchronizes employee check-in/check-out t
 - API access enabled
 - Superuser credentials available
 
-### ERPNext Requirements
-- ERPNext v13+ or Frappe v13+
-- HR module enabled
+### Framework Requirements
+- Frappe **v16** (bench running Python 3.14+ and Node 24+)
+- ERPNext **v16**
+- HRMS **v16** (provides the `Employee Checkin` doctype)
 - Employee records with matching employee codes
+- The background **scheduler** enabled on the site, otherwise nothing syncs automatically
 
 ## Installation
 
-### 1. Install the App
+### On a bench
 ```bash
-# Navigate to your bench directory
 cd /path/to/your/bench
 
-# Get the app
-bench get-app https://github.com/your-username/zkteco_checkins_sync
+bench get-app erpnext --branch version-16
+bench get-app hrms --branch version-16
+bench get-app zkteco_checkins_sync
 
-# Install on your site
+bench --site your-site.com install-app erpnext
+bench --site your-site.com install-app hrms
 bench --site your-site.com install-app zkteco_checkins_sync
 
-# Migrate the database
 bench --site your-site.com migrate
+bench build
 ```
+
+### On Frappe Cloud
+1. Make sure **ERPNext** and **HRMS** are installed on the site.
+2. Install the app from the marketplace / app manager, or push it to the bench.
+3. Open the app, fill in the settings below, and click **Register API token**.
+
+> Cloud note: the app talks outbound to your ZKTeco device, so the device must be reachable
+> from the Cloud bench (public IP, VPN or tunnel). A device on a private LAN will not be
+> reachable from Cloud unless you expose it.
 
 ### 2. Setup ZKTeco Device
 
@@ -59,9 +86,9 @@ curl -X GET "http://[DEVICE_IP]:[PORT]/iclock/api/transactions/"
 ## Configuration
 
 ### 1. Access ZKTeco Config
-1. Login to ERPNext
-2. Go to: **Setup** → **ZKTeco Checkin Sync** → **ZKTeco Config**
-3. Enable sync: Check **"Enable Sync"**
+1. Login to the desk
+2. Search for **ZKTeco Config** in the global search (it is a Single DocType)
+3. Enable sync: check **"Enable Sync"**
 
 ### 2. Configure Connection Settings
 
@@ -112,13 +139,9 @@ ERPNext Employee → User ID = ZKTeco emp_code
 Example: User ID = "E001" matches ZKTeco emp_code = "E001"
 ```
 
-#### Method 3: Custom Field (Advanced)
-1. Create custom field in Employee doctype:
-   - **Field Name**: `attendance_device_id`
-   - **Field Type**: Data
-   - **Label**: Attendance Device ID
-
-2. Set the field value to match ZKTeco emp_code
+#### Method 3: Attendance Device ID
+ERPNext v14+ ships an `attendance_device_id` field on Employee. Set it to the `emp_code`
+reported by the device. No custom field is needed.
 
 ## Testing & Verification
 
@@ -222,29 +245,25 @@ Monitor error logs in:
 
 ### Debug Mode
 ```python
-# Enable detailed logging
-frappe.log_error("Debug message", "ZKTeco Debug")
+# Enable detailed logging (v16 keyword arguments)
+frappe.log_error(title="ZKTeco Debug", message=frappe.get_traceback())
 ```
 
 ## Advanced Configuration
 
-### Custom Scheduler Frequency
-```python
-# In hooks.py, modify get_scheduler_events()
-# Add custom frequency mappings
-```
+### Sync Frequency
+No code change is needed. `ZKTeco Config → Sync Frequency` is read at runtime by
+`scheduled_sync()`, which self-throttles using a Redis key. `scheduler_events` in
+`hooks.py` is intentionally a static literal: Frappe imports `hooks.py` before the site
+database is connected, so it must never query the database at import time.
 
 ### Custom Employee Mapping
-```python
-# Override find_employee_by_code() function
-# Add custom mapping logic
-```
+Override `find_employee_by_code()` in
+`zkteco_checkins_sync/zkteco_checkin_sync/doctype/zkteco_config/zkteco_config.py`
+to add your own matching rules.
 
 ### Field Customization
-```python
-# Modify create_employee_checkin() function
-# Map additional ZKTeco fields to custom fields
-```
+Extend `create_employee_checkin()` to map additional ZKTeco fields onto custom fields.
 
 ## Performance Optimization
 
@@ -306,6 +325,23 @@ For technical support or feature requests:
 - Email: osama.ahmed@deliverydevs.com
 
 ## Changelog
+
+### Version 1.0.0 — Frappe v16 upgrade
+- Rebuilt for Frappe v16 / ERPNext v16; added HRMS as a required app
+- **Fixed**: the ZKTeco superuser password was read with `db.get_single_value`, which returns
+  the *encrypted* blob, so token registration always sent a garbage password
+- **Fixed**: a malformed `frappe.db.get_value(...)` call passed a filter dict as the legacy
+  `ignore` argument, silently swallowing errors and always returning `None`
+- **Fixed**: duplicate detection compared against the raw device id while check-ins were stored
+  with a transaction-id suffix, so every run re-imported the same punches
+- **Fixed**: the API token was stored in plain text; it is now a Password field
+- **Fixed**: whitelisted methods had no permission check and were callable by any logged-in user
+- **Fixed**: `get_scheduler_events()` queried the database at `hooks.py` import time, which
+  breaks `bench build`, `bench new-site` and `bench migrate`
+- **Fixed**: disabled/unconfigured syncs wrote Error Log rows on every run
+- Added transaction pagination for large result sets
+- Added a real test suite (23 tests) and updated CI to v16
+- Replaced deprecated `FrappeTestCase` with `IntegrationTestCase`
 
 ### Version 0.0.1
 - Initial release
